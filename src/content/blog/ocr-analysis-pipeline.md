@@ -58,11 +58,11 @@ pubDate: 2026-09-02
 
 如果所有资料都交给一次模型调用处理，答案页识别失败可能迫使系统重新识别整张试卷，也很难准确告诉用户哪些答案来自真实图片、哪些答案来自 AI。输入分离以后，每条支路可以独立处理、独立失败，也可以记录自己的来源。
 
-## 3. 先建立题目骨架，再按题号补充答案
+## 3. 三类识别结果如何合并成一道完整题目
 
 系统不会同时启动三条互不相关的识别任务，而是先处理试卷，因为标准答案和学生答案都需要依附在具体题号上。
 
-### 3.1 试卷识别建立主数据
+### 3.1 从试卷中提取题目结构
 
 每张试卷图片首先经过图片预处理，转换成适合识别的 JPEG 字节。随后，PaddleOCR 提取文字块、坐标和字符置信度；图片和 OCR 参考文本再一起交给视觉模型，由模型输出结构化题目。
 
@@ -91,7 +91,7 @@ pubDate: 2026-09-02
 
 试卷识别只负责先回答“第 1 题是什么”。另外两类答案还没有填入。
 
-### 3.2 答题卡只写入学生答案
+### 3.2 按题号关联学生答案
 
 如果用户上传了答题卡，系统会使用专门的学生作答识别 Prompt，提取手写圈选、填涂、字母或数字，输出“题号到学生答案”的映射：
 
@@ -112,7 +112,7 @@ for question in exam.questions:
 
 这一步不会修改标准答案。即使答题卡上的内容识别错误，受影响的也是学生答案支路，不会覆盖题干和正确答案。
 
-### 3.3 标准答案只写入正确答案
+### 3.3 按题号关联标准答案
 
 标准答案图片走另一套 Prompt，也返回题号到答案的映射。服务仍然以题号为关联键，但这次写入的是 `correct_answer`：
 
@@ -143,37 +143,161 @@ AI 补齐时，系统会保留答案图已经识别成功的题目，只接受�
 
 ## 4. Pydantic Schema 如何形成数据契约
 
-分开识别只能解决数据来源问题，系统还需要保证不同模块对字段含义有一致理解。我在 OCR 管线中定义了 `StandardizedQuestion` 和 `StandardizedExam`，把模型返回的不稳定 JSON 转换成明确的数据结构。
+分开识别只能解决数据来源问题，系统还需要保证 OCR 服务、前端页面和分析引擎对每个字段有一致理解。模型返回的是不稳定 JSON：字段可能缺失、类型可能变化，甚至可能把学生答案写进题干。如果后面的服务直接读取这份原始 JSON，每个模块都要重复判断“这个键是否存在”“这个值究竟是什么类型”，错误也会一直拖到判分阶段才暴露。
 
-`StandardizedQuestion` 约束一道题至少要包含题号、题型和题干，同时定义标准答案、学生答案、置信度、待复核状态和配图信息。`StandardizedExam` 再补充上传批次、年级、学期、教材版本、整卷置信度和答案来源状态。
+我在这条链路中设置了两层 Pydantic 契约。第一层描述“图片识别出了什么”，第二层描述“分析服务需要什么”。前端核对页位于两层之间，负责把用户确认后的 OCR 结果显式转换成分析请求。
 
-这份 Schema 带来了三个作用：
+### 4.1 `StandardizedQuestion`：先固定一道题的语义
 
-1. **统一字段语义**：学生答案只能进入 `student_answer`，判分依据只能进入 `correct_answer`。
-2. **提前暴露格式问题**：例如置信度必须在 0 到 1 之间，年级和学期必须落在允许范围内。
-3. **隔离模型输出与业务逻辑**：后面的代码消费 Pydantic 对象，而不是在每个步骤里重复猜测模型 JSON 的字段。
+OCR 层最小的数据单元是 `StandardizedQuestion`。其中 `number`、`type` 和 `stem` 是必填字段，分别表示题号、题型和题干；其他字段则按来源和场景允许为空：
 
-不过，OCR 输出并不是分析引擎的最终输入。用户点击“开始分析”后，前端还会把 `StandardizedExam` 转换成 `StartAnalysisRequest`：
+| 字段 | 含义 | 为什么单独保存 |
+| --- | --- | --- |
+| `options` | 选择题选项 | 避免把选项混入题干，便于后续按题型处理 |
+| `correct_answer` | 判分使用的标准答案 | 与学生答案严格分离，可以记录答案图或 AI 补全结果 |
+| `student_answer` | 从答题卡识别出的答案 | 明确表示独立答题卡这一路的结果 |
+| `student_handwriting` | 从原试卷空白处识别的手写内容 | 在没有独立答题卡结果时作为学生答案的回退来源 |
+| `ocr_confidence` | 本题 OCR 置信度 | 低置信度题目可以在页面上提示复核 |
+| `needs_review` | 是否需要人工检查 | 把“不确定性”变成可被前端消费的状态，而不是只写日志 |
+| `has_figure`、`figure_desc` | 是否含图及图片描述 | 提醒后续模块不能只依据纯文本理解题目 |
 
-```text
-OCR 的 correct_answer
-→ 分析请求的 standard_answer
+这里最重要的不是字段数量，而是字段不能互相代替。例如，`correct_answer` 表示“系统准备拿什么判分”，`student_answer` 表示“学生提交了什么”，二者即使文本完全相同，也属于不同事实。`student_handwriting` 也不能直接覆盖 `student_answer`，因为前者来自试卷手写区域，后者来自独立答题卡，它们的来源可信度和冲突处理方式不同。
 
-OCR 的 student_answer 或 student_handwriting
-→ 分析请求的 student_answer
+经过这一层后，后续代码面对的不再是一组任意键值，而是一道具有固定语义的题目：
+
+```json
+{
+  "number": 2,
+  "type": "fill_blank",
+  "stem": "方程 x²-5x+6=0 的解是____。",
+  "options": null,
+  "correct_answer": "x=2 或 x=3",
+  "student_answer": null,
+  "student_handwriting": "x=2",
+  "ocr_confidence": 0.91,
+  "needs_review": false,
+  "has_figure": false,
+  "figure_desc": null
+}
 ```
 
-分析阶段使用的单题契约叫 `QuestionForGrading`。它在题目和两类答案之外，还预留了难度、满分和知识点列表。知识点此时先为空，进入分析后再根据可信知识点目录进行预分类。
+这个例子也说明了“字段完整”和“业务信息完整”不是一回事。对象可以通过 Schema 校验，但学生只写出一个解，是否得分仍然要交给后面的判分逻辑决定。
 
-因此，这里实际存在两层契约：
+### 4.2 `StandardizedExam`：给整批识别结果补充上下文
+
+单题结构确定以后，`StandardizedExam` 把所有题目放进同一个上传批次，并补充整卷范围：
+
+- `session_id` 关联本次上传及保存的图片记录；
+- `subject`、`grade`、`semester` 和 `textbook_version` 确定后续知识点查询边界；
+- `questions` 保存标准化后的题目列表；
+- `unmatched_regions` 保留无法归属到题号的 OCR 区域，避免静默丢失；
+- `overall_confidence` 描述整卷识别置信度；
+- `recognize_status` 说明标准答案来自答案图、部分 AI 补全还是完全 AI 求解；
+- `image_paths` 保存需要携带 JWT 才能访问的图片 API 路径。
+
+因此，`StandardizedExam` 不只是“多道题的数组”。它同时保存了追踪信息、教材范围和不确定性来源。分析服务以后需要解释一份报告时，可以知道它属于哪次上传、使用哪个学期的知识点目录，以及标准答案是否经过 AI 补全。
+
+### 4.3 Pydantic 在这里具体拦截什么
+
+Pydantic 会在对象构造和 API 请求解析时完成类型转换与字段校验。当前实现中，以下约束已经直接写进 Schema：
+
+- `ocr_confidence` 和 `overall_confidence` 必须在 0 到 1 之间；
+- `grade` 只能是 1 到 3；
+- `semester` 只能是 1 或 2；
+- `textbook_version` 不能为空，并限制最大长度；
+- `questions` 必须是 `StandardizedQuestion` 列表，而不是任意结构；
+- `options` 如果存在，必须是字符串列表。
+
+例如，模型返回 `ocr_confidence: 1.4`，或者把 `options` 返回成一个普通字符串，这份数据不能悄悄进入分析管线，而会在 Schema 边界暴露问题。这样，错误会停留在离模型输出最近的位置，排查时也更容易判断是 OCR 解析问题，而不是后面的判分问题。
+
+但 Pydantic 并不自动理解全部业务规则。当前 `type` 和 `recognize_status` 仍然是普通字符串，没有使用 `Literal` 限制所有枚举值；`stem` 也没有设置最小长度。这意味着 Schema 可以保证基本类型和部分范围，却不能单独保证“题型一定合法”“题干一定完整”“答案一定正确”。这些内容仍需要 Prompt 约束、服务逻辑、页面复核和测试共同保证。
+
+### 4.4 前端不是透传，而是一个显式适配层
+
+用户在 OCR 结果页看到的是 `StandardizedExam`。页面先用每道题的 `correct_answer` 初始化可编辑区域；如果用户修改标准答案，点击“开始分析”时，前端会先把修改后的值写回当前 OCR 结果，再进入报告页。
+
+报告页不会把整个 `StandardizedExam` 原样提交给分析接口，而是构造新的 `StartAnalysisRequest`。核心字段映射如下：
 
 ```text
-图片识别层：StandardizedExam
-→ 用户检查与字段转换
-分析业务层：StartAnalysisRequest / QuestionForGrading
+StandardizedQuestion.number（整数）
+→ String(number)
+→ QuestionForGrading.number（字符串）
+
+correct_answer
+→ standard_answer
+
+student_answer 存在时优先使用
+否则回退到 student_handwriting
+→ QuestionForGrading.student_answer
 ```
 
-相比让 OCR 输出直接贯穿所有后续模块，两层 Schema 多了一次明确转换，却让边界更加清楚：OCR 负责“识别到了什么”，分析服务负责“用这些数据做什么”。
+题号从整数转成字符串，是因为分析层的题号契约允许表达类似 `2.1` 的子题编号。当前 OCR Schema 仍只接受整数题号，因此这一转换主要统一分析接口的类型，并没有让 OCR 自动获得识别子题号的能力。
+
+学生答案使用“答题卡优先、试卷手写回退”的规则：
+
+```ts
+student_answer: q.student_answer || q.student_handwriting || null
+```
+
+这条映射把来源优先级固定在前端适配层中。分析引擎只接收一个最终的 `student_answer`，不需要再次判断用户是否上传了答题卡，也不需要知道 OCR 内部有几条识别支路。
+
+### 4.5 `StartAnalysisRequest`：切换到分析业务语言
+
+第二层契约由 `StartAnalysisRequest` 和其中的 `QuestionForGrading` 组成。它不再保存 OCR 置信度、未匹配区域或图片路径，因为这些字段不参与判分；相反，它加入了分析阶段真正需要的内容：
+
+- `standard_answer`：统一后的判分依据；
+- `student_answer`：统一后的学生作答；
+- `difficulty`：当前前端默认填入 3；
+- `max_score`：当前前端默认每题 5 分；
+- `knowledge_points`：前端先传空列表，后端再从可信目录中进行预分类。
+
+一次实际转换后的请求大致是：
+
+```json
+{
+  "exam_title": "二次函数练习",
+  "subject": "math",
+  "grade": 3,
+  "semester": 1,
+  "textbook_version": "PEP-CATALOG-V1",
+  "questions": [
+    {
+      "number": "2",
+      "type": "fill_blank",
+      "stem": "方程 x²-5x+6=0 的解是____。",
+      "options": null,
+      "standard_answer": "x=2 或 x=3",
+      "student_answer": "x=2",
+      "difficulty": 3,
+      "knowledge_points": [],
+      "max_score": 5
+    }
+  ]
+}
+```
+
+分析接口再次用 Pydantic 验证这份请求。通过后，知识点预分类、判分和报告生成都围绕 `QuestionForGrading` 工作，不再依赖 OCR 模型的原始响应格式。
+
+### 4.6 两层契约解决的是职责边界
+
+完整的数据流可以概括为：
+
+```text
+模型原始 JSON
+→ StandardizedQuestion / StandardizedExam 校验
+→ 前端展示答案来源并允许用户修正
+→ 显式字段映射与默认值补充
+→ StartAnalysisRequest / QuestionForGrading 再校验
+→ 知识点预分类、判分和报告生成
+```
+
+如果只使用一份“大而全”的 Schema，OCR 字段和分析字段会逐渐混在一起：图片路径、置信度、满分、知识点和判分结果都可能出现在同一个对象里，模块很难判断哪些字段由自己负责。两层契约虽然多了一次转换，却让责任更清楚：
+
+- OCR 层回答“从图片中识别到了什么，以及结果有多确定”；
+- 前端核对层回答“用户最终确认用哪份答案进入分析”；
+- 分析层回答“如何用题目、标准答案和学生答案完成判分与诊断”。
+
+这种设计的价值不是让字段看起来更整齐，而是把错误限制在具体边界。OCR 字段异常在 `StandardizedExam` 构造时暴露，用户修正发生在页面适配层，分析请求不合法则由 `StartAnalysisRequest` 拒绝。每个阶段都只承担自己能够解释的责任。
 
 ## 5. 从结构化题目到错题报告
 
